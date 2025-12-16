@@ -77,7 +77,7 @@ bash <(curl https://raw.githubusercontent.com/pmalacho-mit/suede/refs/heads/main
 
 		constructor() {
 			URLParameterize(this, {
-				hi: { key: "x", parse: (query, decode) => {}, serialize: (y, encode) => {}}
+				hi: { key: "x", parse: (query) => {}, serialize: (y) => {}, encode: ...., decode: ....}
 			})
 		}
 	}
