@@ -77,7 +77,7 @@ bash <(curl https://raw.githubusercontent.com/pmalacho-mit/suede/refs/heads/main
 
 		constructor() {
 			URLParameterize(this, {
-				hi: { key: "x", parse: () => {}, serialize: () => {}}
+				hi: { key: "x", parse: (query, decode) => {}, serialize: (y, encode) => {}}
 			})
 		}
 	}
@@ -89,4 +89,37 @@ bash <(curl https://raw.githubusercontent.com/pmalacho-mit/suede/refs/heads/main
 	clicks: {example.hi}
 </button>
 
+```
+
+```ts
+function setObjectInQuery(key: string, value: unknown, { replace = false } = {}) {
+  const url = new URL(window.location.href);
+
+  const serialized = encodeURIComponent(JSON.stringify(value));
+  url.searchParams.set(key, serialized);
+
+  const method = replace ? "replaceState" : "pushState";
+  history[method](null, "", url.toString());
+}
+
+function getObjectFromQuery<T>(
+  key: string,
+  validate?: (value: unknown) => value is T
+): T | null {
+  const url = new URL(window.location.href);
+  const raw = url.searchParams.get(key);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(decodeURIComponent(raw));
+
+    if (validate && !validate(parsed)) {
+      return null;
+    }
+
+    return parsed as T;
+  } catch {
+    return null;
+  }
+}
 ```
