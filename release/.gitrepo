@@ -6,7 +6,7 @@
 [subrepo]
 	remote = https://github.com/pmalacho-mit/svelte-url-parameterizer-suede
 	branch = release
-	commit = 684c4c368ea68e42f2b430d7c2e0c98a5a585158
-	parent = 99026d6a508b2cf29e87959b429264205136df95
+	commit = 66904afd8b7d22bfaa19c890c83e64b5889046e3
+	parent = 24a25a2db9fa36114890cf2663944273fd731420
 	method = merge
 	cmdver = 0.4.9
