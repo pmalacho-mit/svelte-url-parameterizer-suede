@@ -1,10 +1,10 @@
-export { URLParameterize, defaults } from "./index.svelte";
+export { URLParameterize, defaults } from "./URLParameterize.svelte";
 
 import type {
   ParameterHandlers,
   ParameterHandler,
   Options as URLParameterizeOptions,
-} from "./index.svelte";
+} from "./URLParameterize.svelte";
 
 export namespace URLParameterize {
   /**
