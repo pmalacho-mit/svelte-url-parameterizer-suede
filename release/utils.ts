@@ -16,3 +16,12 @@ export type ExpandRecursively<T> = T extends object
     ? { [K in keyof O]: ExpandRecursively<O[K]> }
     : never
   : T;
+
+export type MaybeGetter<T> = T | (() => T);
+
+export const resolve = <T>(value: MaybeGetter<T>, fallback?: T): T => {
+  if (typeof value === "function") {
+    const result = (value as () => T)();
+    return result === undefined ? (fallback as T) : result;
+  } else return value === undefined ? (fallback as T) : value;
+};

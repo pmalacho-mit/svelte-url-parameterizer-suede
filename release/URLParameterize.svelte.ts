@@ -1,4 +1,9 @@
-import { type Expand, supportsHistory } from "./utils";
+import {
+  type Expand,
+  type MaybeGetter,
+  supportsHistory,
+  resolve,
+} from "./utils";
 import { type Config as DebounceConfig, MappedDebouncer } from "./debounce";
 
 type UpdateHistoryBehavior = "push" | "replace";
@@ -47,7 +52,7 @@ type SingularVerboseParameterHandler<T> = Expand<{
    * @param query The intermediate representation of the query parameter value (e.g., a JavaScript object)
    * @returns The resolved value of type T for use in the application
    */
-  resolve: (query: unknown) => T;
+  resolve: (query: unknown, param: string, index: number | undefined) => T;
   /**
    * Converts the application value into a string for URL storage.
    *
@@ -88,7 +93,27 @@ type SingularVerboseParameterHandler<T> = Expand<{
    * @default encodeURIComponent
    */
   encode?: (serialized: string) => string;
+
+  previousKeys?:
+    | {
+        fullname: string;
+        remove?: boolean;
+        apply?: boolean;
+        behavior?: UpdateHistoryBehavior;
+      }[]
+    | null;
 }>;
+
+export type Options = Partial<
+  {
+    prefix: MaybeGetter<string>;
+    onDestroy: (callback: () => void) => void;
+    debounce: DebounceConfig;
+  } & Pick<
+    SingularVerboseParameterHandler<any>,
+    "history" | "encode" | "decode" | "deserialize" | "serialize"
+  >
+>;
 
 /**
  * Default configuration values for URL parameter handlers.
@@ -113,6 +138,7 @@ export const defaults = {
     query !== "undefined" ? JSON.parse(query) : undefined,
   /** Default serializer: converts values to JSON strings */
   serialize: (value) => JSON.stringify(value),
+  previousKeys: null,
 } as const satisfies Pick<
   SingularVerboseParameterHandler<any>,
   | "encode"
@@ -122,6 +148,7 @@ export const defaults = {
   | "history"
   | "entries"
   | "debounce"
+  | "previousKeys"
 >;
 
 type Default<K extends keyof typeof defaults> = (typeof defaults)[K];
@@ -155,6 +182,8 @@ export type ParameterHandlers<T> = {
 type ResolvedParameterHandler<T> = Required<VerboseParameterHandler<T>>;
 type AnyParameterHandler = ResolvedParameterHandler<any | any[]>;
 
+const validParam = (key: string) => encodeURIComponent(key);
+
 const verbosify = <T>(
   handler: ParameterHandler<T>,
   key: string,
@@ -170,9 +199,10 @@ const verbosify = <T>(
       )
     : ({
         resolve: handler.resolve,
-        key: encodeURIComponent((options?.prefix ?? "") + (handler.key ?? key)),
+        key: validParam(resolve(options?.prefix, "") + (handler.key ?? key)),
         entries: (handler.entries ?? defaults.entries) as Default<"entries">,
         debounce: handler.debounce ?? defaults.debounce,
+        previousKeys: handler.previousKeys ?? defaults.previousKeys,
         history: handler.history ?? options?.history ?? defaults.history,
         deserialize:
           handler.deserialize ?? options?.deserialize ?? defaults.deserialize,
@@ -201,6 +231,29 @@ const getURLState = () => {
   });
   return state;
 };
+
+const cachify = (param: string, ...values: string[]) =>
+  new URLSearchParams(values.map((v) => [param, v])).toString();
+
+const evaluate = (
+  { decode, deserialize, resolve }: ResolvedParameterHandler<any | any[]>,
+  value: string,
+  param: string,
+  index: number | undefined = undefined
+) => resolve(deserialize(decode(value)), param, index);
+
+const serialize = (value: any, { serialize, entries }: AnyParameterHandler) =>
+  entries === "multiple" && Array.isArray(value)
+    ? value.map(serialize)
+    : serialize(value);
+
+const encode = (serialized: any, { entries, encode }: AnyParameterHandler) =>
+  entries === "multiple" && Array.isArray(serialized)
+    ? serialized.map(encode)
+    : encode(serialized);
+
+const parameterize = (value: any, handler: AnyParameterHandler) =>
+  encode(serialize(value, handler), handler);
 
 const URLChangeEvent = {
   key: "urlchange",
@@ -242,57 +295,196 @@ const URLChangeEvent = {
     return (URLChangeEvent.setupComplete = true);
   },
 
-  trigger: (
+  modifySearchParam: (
+    param: string,
     value: string[] | string | undefined,
-    { key, history }: AnyParameterHandler
+    url?: URL
   ) => {
-    if (!URLChangeEvent.setupListener()) return;
+    url ??= new URL(window.location.href);
+    const { searchParams } = url;
 
-    const url = new URL(window.location.href);
-
-    if (value === undefined) url.searchParams.delete(key);
+    if (value === undefined) searchParams.delete(param);
     else if (Array.isArray(value)) {
-      url.searchParams.delete(key);
-      value.forEach((v) => url.searchParams.append(key, v));
-    } else url.searchParams.set(key, value);
+      searchParams.delete(param);
+      value.forEach(searchParams.append.bind(searchParams, param));
+    } else searchParams.set(param, value);
 
-    window.history[`${history}State`]({}, "", url);
+    return url;
+  },
+
+  commit: (url: URL, behavior: UpdateHistoryBehavior) => {
+    if (!URLChangeEvent.setupListener()) return;
+    window.history[`${behavior}State`]({}, "", url);
+  },
+
+  trigger: (
+    param: string,
+    value: string[] | string | undefined,
+    behavior: UpdateHistoryBehavior
+  ) =>
+    URLChangeEvent.commit(
+      URLChangeEvent.modifySearchParam(param, value),
+      behavior
+    ),
+
+  batchTrigger: (
+    values: { param: string; value: string[] | string | undefined }[],
+    behavior: UpdateHistoryBehavior
+  ) => {
+    const url = new URL(window.location.href);
+    for (const { param, value } of values)
+      URLChangeEvent.modifySearchParam(param, value, url);
+    URLChangeEvent.commit(url, behavior);
   },
 };
 
-const cachify = (param: string, ...values: string[]) =>
-  new URLSearchParams(values.map((v) => [param, v])).toString();
+const globals = {
+  debouncer: new MappedDebouncer<string>({ idleMs: -1, maxWaitMs: -1 }),
+  debounce: (param: string, callback: () => void, config: DebounceConfig) =>
+    globals.debouncer.enqueue(param, callback, config),
+  handlerByParam: new Map<string, AnyParameterHandler>(),
+  safeSetHandler: (handler: AnyParameterHandler) => {
+    if (globals.handlerByParam.has(handler.key))
+      throw new Error(`URL parameter key conflict detected: "${handler.key}"`);
+    globals.handlerByParam.set(handler.key, handler);
+  },
+  unsafeSetHandler: (handler: AnyParameterHandler) => {
+    globals.handlerByParam.set(handler.key, handler);
+  },
+  handler: (param: string) => globals.handlerByParam.get(param),
+  cachedByParam: new Map<string, string>(),
+  cache: (param: string, value: string) =>
+    globals.cachedByParam.set(param, value),
+  cached: (param: string) => globals.cachedByParam.get(param),
 
-const evaluate = (
-  { decode, deserialize, resolve }: ResolvedParameterHandler<any | any[]>,
-  value: string
-) => resolve(deserialize(decode(value)));
+  trySetFromURL: <T>(
+    state: URLState,
+    target: T,
+    key: keyof T,
+    param: string,
+    handler?: AnyParameterHandler,
+    doCache = true
+  ) => {
+    if (!state.has(param)) {
+      globals.cachedByParam.delete(param);
+      if (Array.isArray(target[key])) target[key].length = 0;
+      return;
+    }
 
-const urlify = (
-  { encode, serialize }: ResolvedParameterHandler<any | any[]>,
-  value: any
-) => encode(serialize(value));
+    const current = state.get(param)!;
+    const isArray = Array.isArray(current);
+    handler ??= globals.handlerByParam.get(param)!;
+    const isMultiple = supportsMultiple(handler);
 
-const keysInUse = new Set<string>();
+    if (isArray && !isMultiple) throw new Error("Expected multiple values");
 
-const checkForKeyConflict = ({ key }: AnyParameterHandler) => {
-  if (keysInUse.has(key))
-    throw new Error(`URL parameter key conflict detected: "${key}"`);
-  keysInUse.add(key);
+    if (isArray || isMultiple) {
+      const arr = target[key] as any[];
+      const values = isArray ? current : [current];
+      const previous = new URLSearchParams(globals.cached(param)).getAll(param);
+
+      for (let index = 0; index < values.length; index++)
+        if (values[index] !== previous[index])
+          arr[index] = evaluate(handler, values[index], param, index);
+
+      arr.splice(values.length, previous.length - values.length);
+      if (doCache) globals.cache(param, cachify(param, ...values));
+    } else {
+      const previous = new URLSearchParams(globals.cached(param)).get(param);
+      if (current === previous) return;
+      target[key] = evaluate(handler, current, param);
+      if (doCache) globals.cache(param, cachify(param, current));
+    }
+  },
+  trySetURLParam: (
+    param: string,
+    value: string | string[],
+    behavior: UpdateHistoryBehavior
+  ) => {
+    const cached = Array.isArray(value)
+      ? cachify(param, ...value)
+      : cachify(param, value);
+
+    if (globals.cached(param) !== cached) {
+      globals.cache(param, cached);
+      URLChangeEvent.trigger(param, value, behavior);
+    }
+  },
+  trySetURLParams: (
+    values: { param: string; value: string[] | string | undefined }[],
+    behavior: UpdateHistoryBehavior
+  ) => {
+    URLChangeEvent.batchTrigger(
+      values.filter(({ param, value }) => {
+        const cached = Array.isArray(value)
+          ? cachify(param, ...value)
+          : cachify(param, value!);
+        return globals.cached(param) !== cached
+          ? (globals.cache(param, cached), true)
+          : false;
+      }),
+      behavior
+    );
+  },
+  delete: (param: string) => {
+    globals.debouncer.clear(param);
+    globals.cachedByParam.delete(param);
+    globals.handlerByParam.delete(param);
+    URLChangeEvent.trigger(param, undefined, "replace");
+  },
 };
 
-const debouncer = new MappedDebouncer<string>({ idleMs: -1, maxWaitMs: -1 });
+const tryProcessHistoricalKeys = <T, Key extends keyof T>(
+  target: T,
+  key: Key,
+  handler: AnyParameterHandler,
+  state: URLState
+) => {
+  if (!handler.previousKeys) return;
 
-export type Options = Partial<
-  {
-    prefix: string;
-    cleanup: (callback: () => void) => void;
-    debounce: DebounceConfig;
-  } & Pick<
-    SingularVerboseParameterHandler<any>,
-    "history" | "encode" | "decode" | "deserialize" | "serialize"
-  >
->;
+  let replacements: string[] | undefined;
+  let pushes: string[] | undefined;
+  for (const {
+    fullname,
+    remove = true,
+    apply = true,
+    behavior = "replace",
+  } of handler.previousKeys) {
+    const param = validParam(fullname);
+
+    if (apply) globals.trySetFromURL(state, target, key, param, handler, false);
+
+    if (remove)
+      behavior === "push"
+        ? (pushes ??= []).push(param)
+        : (replacements ??= []).push(param);
+  }
+
+  if (pushes)
+    URLChangeEvent.batchTrigger(
+      pushes.map((p) => ({ param: p, value: undefined })),
+      "push"
+    );
+  if (replacements)
+    URLChangeEvent.batchTrigger(
+      replacements.map((p) => ({ param: p, value: undefined })),
+      "replace"
+    );
+};
+
+export type Return = {
+  cleanup: () => void;
+  prefix: (prefix: string) => void;
+};
+
+const errorOnUnsupported = () => {
+  console.error("History API not supported; URLParameterize disabled");
+};
+
+const unsupported: Return = {
+  cleanup: errorOnUnsupported,
+  prefix: errorOnUnsupported,
+};
 
 /**
  * Synchronizes an object's properties with URL query parameters.
@@ -320,120 +512,103 @@ export type Options = Partial<
  * }
  * ```
  */
-export const URLParameterize = <T>(
+const URLParameterize = <T>(
   target: T,
   handlers: Partial<ParameterHandlers<T>>,
   options?: Options
-) => {
-  if (!URLChangeEvent.setupListener())
-    return () => {
-      console.error("History API not supported; URLParameterize disabled");
-    };
+): Return => {
+  if (!URLChangeEvent.setupListener()) return unsupported;
 
   type Key = keyof T & string;
-
-  const cache = new Map<Key, string>();
-  const handlerByKey = new Map<Key, AnyParameterHandler>();
   const paramByKey = new Map<Key, string>();
-
-  const trySetURL = (key: Key, value: any, handler: AnyParameterHandler) => {
-    const query = urlify.bind(null, handler);
-
-    const isMultiple = handler.entries === "multiple" && Array.isArray(value);
-    const urlified = isMultiple ? value.map(query) : query(value);
-
-    const cached = Array.isArray(urlified)
-      ? cachify(handler.key, ...urlified)
-      : cachify(handler.key, urlified);
-
-    if (cache.get(key) !== cached) {
-      cache.set(key, cached);
-      URLChangeEvent.trigger(urlified, handler);
-    }
-  };
-
-  const setFromURL = (state: URLState, param: string, key: Key) => {
-    if (!state.has(param)) {
-      cache.delete(key);
-      if (Array.isArray(target[key])) target[key].length = 0;
-      return;
-    }
-
-    const handler = handlerByKey.get(key)!;
-    const stored = state.get(param)!;
-    const isArray = Array.isArray(stored);
-    const isMultiple = supportsMultiple(handler);
-
-    if (isArray && !isMultiple) throw new Error("Expected multiple values");
-
-    if (isArray || isMultiple) {
-      const arr = target[key] as any[];
-      const values = isArray ? stored : [stored];
-      const previous = new URLSearchParams(cache.get(key)).getAll(param);
-
-      for (let i = 0; i < values.length; i++)
-        if (values[i] !== previous[i]) arr[i] = evaluate(handler, values[i]);
-
-      arr.splice(values.length, previous.length - values.length);
-      cache.set(key, cachify(param, ...values));
-    } else {
-      const previous = new URLSearchParams(cache.get(key)).get(param);
-      if (stored === previous) return;
-      target[key] = evaluate(handler, stored);
-      cache.set(key, cachify(param, stored));
-    }
-  };
 
   const onURLChange = (event: Event) => {
     const state = URLChangeEvent.stateFromEvent(event);
-    if (state) paramByKey.forEach(setFromURL.bind(null, state));
+    if (state)
+      paramByKey.forEach((param, key) =>
+        globals.trySetFromURL(state, target, key, param)
+      );
   };
 
   window.addEventListener(URLChangeEvent.key, onURLChange);
 
+  let disposed = false;
   const dispose = () => {
-    cache.clear();
-    handlerByKey.clear();
-    for (const param of paramByKey.values()) {
-      debouncer.clear(param);
-      keysInUse.delete(param);
-    }
+    if (disposed) return;
+    disposed = true;
+    for (const param of paramByKey.values()) globals.delete(param);
     paramByKey.clear();
     window.removeEventListener(URLChangeEvent.key, onURLChange);
   };
 
-  const effect = (key: Key, state: URLState) => {
+  const setupEffect = (key: Key, state: URLState) => {
     const handler = verbosify<any>(handlers[key]!, key, options);
 
-    checkForKeyConflict(handler);
+    globals.safeSetHandler(handler);
 
     const param = handler.key;
+    paramByKey.set(key, param);
+
     const debounce =
       handler.debounce === false
         ? undefined
         : handler.debounce ?? options?.debounce;
 
-    handlerByKey.set(key, handler);
-    paramByKey.set(key, param);
+    tryProcessHistoricalKeys(target, key, handler, state);
 
-    setFromURL(state, param, key);
+    globals.trySetFromURL(state, target, key, param, handler);
 
-    const update = () => trySetURL(key, target[key], handler);
+    const update = (serialized?: string | string[]) =>
+      globals.trySetURLParam(
+        param,
+        serialized
+          ? encode(serialized, handler)
+          : parameterize(target[key], handler),
+        handler.history
+      );
 
     $effect(() => {
-      if (!debounce) return update();
-      $state.snapshot(target[key]); // track deeply
-      debouncer.enqueue(param, update, debounce);
+      const serialized = serialize(target[key], handler); // ensures tracking, even if debounced
+      debounce ? globals.debounce(param, update, debounce) : update(serialized);
+    });
+  };
+
+  const updatePrefix = (prefix: string) => {
+    const updates: { param: string; value: string[] | string }[] = [];
+    for (const [key, param] of paramByKey) {
+      const handler = globals.handler(param)!;
+      handler.key = validParam(prefix + key);
+      globals.delete(param);
+      globals.unsafeSetHandler(handler);
+      paramByKey.set(key, handler.key);
+      updates.push({
+        param: handler.key,
+        value: parameterize(target[key], handler),
+      });
+    }
+    globals.trySetURLParams(updates, "replace");
+  };
+
+  const trySetupPrefixEffect = () => {
+    if (typeof options?.prefix !== "function") return;
+    const { prefix } = options;
+    let previous = prefix();
+    $effect(() => {
+      const current = prefix();
+      if (previous !== current) updatePrefix((previous = current));
     });
   };
 
   const cleanup = $effect.root(() => {
     const state = getURLState();
-    for (const key in handlers) effect(key as Key, state);
+    for (const key in handlers) setupEffect(key as Key, state);
+    trySetupPrefixEffect();
     return dispose;
   });
 
-  options?.cleanup?.(cleanup);
+  options?.onDestroy?.(cleanup);
 
-  return cleanup;
+  return { cleanup, prefix: updatePrefix };
 };
+
+export default Object.assign(URLParameterize, defaults);

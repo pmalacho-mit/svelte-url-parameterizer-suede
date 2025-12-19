@@ -1,12 +1,15 @@
-export { URLParameterize, defaults } from "./URLParameterize.svelte";
+export { default as URLParameterize, defaults } from "./URLParameterize.svelte";
 
 import type {
   ParameterHandlers,
   ParameterHandler,
   Options as URLParameterizeOptions,
+  Return as URLParameterizeReturn,
 } from "./URLParameterize.svelte";
 
 export namespace URLParameterize {
+  export type Return = URLParameterizeReturn;
+
   /**
    * Defines parameter handlers for all properties of type T.
    *
