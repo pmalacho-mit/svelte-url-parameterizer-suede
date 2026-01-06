@@ -37,15 +37,17 @@ export class MappedDebouncer<T> {
   enqueue(key: T, callback: () => void, config?: Config) {
     if (config) MappedDebouncer.ValidateConfig(config);
 
-    this.clear(key);
-    this.callbacks.set(key, callback);
-    const flush = this.flush.bind(this, key);
-
     const idleMs = config?.idleMs ?? this.opts.idleMs; // flush after `idleMs` of idle (i.e., no new `enqueue` calls)
     const maxWaitMs = config?.maxWaitMs ?? this.opts.maxWaitMs; // but at least every `maxWaitMs`
 
+    this.callbacks.set(key, callback);
+
+    clearTimeout(this.idleTimers.get(key));
+    const flush = this.flush.bind(this, key);
     this.idleTimers.set(key, window.setTimeout(flush, idleMs));
-    this.maxTimers.set(key, window.setTimeout(flush, maxWaitMs));
+
+    if (!this.maxTimers.has(key))
+      this.maxTimers.set(key, window.setTimeout(flush, maxWaitMs));
   }
 
   private flush(key: T) {
